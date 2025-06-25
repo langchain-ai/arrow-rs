@@ -598,7 +598,7 @@ where
                 running += metadata.row_group(rg).num_rows() as usize;
             }
             Some(first_row)
-        } else  {
+        } else {
             None
         };
 
@@ -611,7 +611,7 @@ where
             offset,
             provenance: Some(provenance),
             row_group_first_row,
-            file_id
+            file_id,
         }
     }
 
@@ -619,7 +619,7 @@ where
     fn file_row_base(&self, row_group_idx: usize) -> Option<usize> {
         match self.row_group_first_row {
             Some(ref v) => Some(v[row_group_idx]),
-            None => None
+            None => None,
         }
     }
 
@@ -1186,19 +1186,21 @@ mod tests {
     use crate::file::metadata::ParquetMetaDataReader;
     use crate::file::properties::WriterProperties;
     use arrow::compute::kernels::cmp::{eq, gt_eq};
+    use arrow::compute::kernels::numeric::rem;
     use arrow::error::Result as ArrowResult;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int32Type, UInt16Type, UInt32Type, UInt64Type};
-    use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int8Array, RecordBatchReader, Scalar, StringArray, StructArray, UInt16Array, UInt64Array};
+    use arrow_array::types::{Int32Type, UInt32Type, UInt64Type};
+    use arrow_array::{
+        Array, ArrayRef, Int32Array, Int8Array, RecordBatchReader, Scalar, StringArray,
+        StructArray, UInt16Array, UInt64Array,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::{StreamExt, TryStreamExt};
     use rand::{rng, Rng};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::tempfile;
-    use arrow::compute::kernels::numeric::rem;
-    use arrow_schema::DataType::UInt16;
 
     #[derive(Clone)]
     struct TestReader {
@@ -2470,39 +2472,62 @@ mod tests {
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, expected_file_ids.len(), "Total rows mismatch");
-        assert_eq!(total_rows, expected_row_group_indices.len(), "Row group indices length mismatch");
-        assert_eq!(total_rows, expected_row_indices.len(), "Row indices length mismatch");
+        assert_eq!(
+            total_rows,
+            expected_row_group_indices.len(),
+            "Row group indices length mismatch"
+        );
+        assert_eq!(
+            total_rows,
+            expected_row_indices.len(),
+            "Row indices length mismatch"
+        );
 
         let schema = batches[0].schema();
-        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
         // Verify provenance columns are present
-        assert!(field_names.contains(&"__file_id"), "Missing __file_id column");
-        assert!(field_names.contains(&"__row_group_idx"), "Missing __row_group_idx column");
-        assert!(field_names.contains(&"__row_idx"), "Missing __row_idx column");
+        assert!(
+            schema.index_of("__file_id").is_ok(),
+            "Missing __file_id column"
+        );
+        assert!(
+            schema.index_of("__row_group_idx").is_ok(),
+            "Missing __row_group_idx column"
+        );
+        assert!(
+            schema.index_of("__row_idx").is_ok(),
+            "Missing __row_idx column"
+        );
 
-        let file_id_idx = schema.index_of("__file_id").unwrap();
-        let row_group_idx_idx = schema.index_of("__row_group_idx").unwrap();
-        let row_idx_idx = schema.index_of("__row_idx").unwrap();
+        // Concatenate all batches into single arrays
+        let concatenated = arrow::compute::concat_batches(&schema, batches).unwrap();
 
-        let mut all_file_ids = Vec::new();
-        let mut all_row_group_indices = Vec::new();
-        let mut all_row_indices = Vec::new();
+        let file_id_col = concatenated
+            .column(schema.index_of("__file_id").unwrap())
+            .as_primitive::<UInt32Type>();
+        let row_group_col = concatenated
+            .column(schema.index_of("__row_group_idx").unwrap())
+            .as_primitive::<UInt32Type>();
+        let row_idx_col = concatenated
+            .column(schema.index_of("__row_idx").unwrap())
+            .as_primitive::<UInt64Type>();
 
-        for batch in batches {
-            let file_id_col = batch.column(file_id_idx).as_primitive::<UInt32Type>();
-            let row_group_col = batch.column(row_group_idx_idx).as_primitive::<UInt32Type>();
-            let row_idx_col = batch.column(row_idx_idx).as_primitive::<UInt64Type>();
-
-            all_file_ids.extend(file_id_col.values().iter().copied());
-            all_row_group_indices.extend(row_group_col.values().iter().copied());
-            all_row_indices.extend(row_idx_col.values().iter().copied());
-        }
-
-        // Verify values match expectations
-        assert_eq!(all_file_ids, expected_file_ids, "File IDs don't match expected values");
-        assert_eq!(all_row_group_indices, expected_row_group_indices, "Row group indices don't match expected values");
-        assert_eq!(all_row_indices, expected_row_indices, "Row indices don't match expected values");
+        // Direct slice comparison
+        assert_eq!(
+            file_id_col.values(),
+            expected_file_ids,
+            "File IDs don't match expected values"
+        );
+        assert_eq!(
+            row_group_col.values(),
+            expected_row_group_indices,
+            "Row group indices don't match expected values"
+        );
+        assert_eq!(
+            row_idx_col.values(),
+            expected_row_indices,
+            "Row indices don't match expected values"
+        );
     }
     #[tokio::test]
     async fn test_provenance_with_row_filter() {
@@ -2515,16 +2540,15 @@ mod tests {
         //   val:  5, 6, 7, 8, 9
         //   ts:   5, 6, 7, 8, 9
         let ts = UInt16Array::from((0..10).collect::<Vec<_>>());
-        let name = StringArray::from(vec![
-            "a","b","c","d","e","f","g","h","i","j",
-        ]);
-        let val= UInt16Array::from((0..10).collect::<Vec<_>>());
+        let name = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+        let val = UInt16Array::from((0..10).collect::<Vec<_>>());
 
         let batch = RecordBatch::try_from_iter(vec![
-            ("ts",   Arc::new(ts)   as ArrayRef),
+            ("ts", Arc::new(ts) as ArrayRef),
             ("name", Arc::new(name) as ArrayRef),
-            ("val",  Arc::new(val)  as ArrayRef),
-        ]).unwrap();
+            ("val", Arc::new(val) as ArrayRef),
+        ])
+        .unwrap();
 
         // write with RG size, two row groups
         let mut buf = Vec::with_capacity(2048);
@@ -2532,8 +2556,7 @@ mod tests {
             .set_max_row_group_size(5)
             .build();
         {
-            let mut writer =
-                ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
             writer.write(&batch).unwrap();
             writer.close().unwrap();
         }
@@ -2568,14 +2591,17 @@ mod tests {
         let expected_row_group_indices = vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
         let expected_row_indices: Vec<u64> = (0..10).collect();
 
-        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+        assert_provenance_columns(
+            &batches,
+            &expected_file_ids,
+            &expected_row_group_indices,
+            &expected_row_indices,
+        );
 
         // This should keep rows 5-9 (from row group 1)
         let val_filter = ArrowPredicateFn::new(
             ProjectionMask::leaves(&metadata.file_metadata().schema_descr(), vec![2]),
-            |batch| {
-                gt_eq(batch.column(0), &UInt16Array::new_scalar(5))
-            }
+            |batch| gt_eq(batch.column(0), &UInt16Array::new_scalar(5)),
         );
 
         let row_filter = RowFilter::new(vec![Box::new(val_filter)]);
@@ -2599,14 +2625,19 @@ mod tests {
         let expected_row_group_indices = vec![1, 1, 1, 1, 1];
         let expected_row_indices: Vec<u64> = (5..10).collect();
 
-        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+        assert_provenance_columns(
+            &batches,
+            &expected_file_ids,
+            &expected_row_group_indices,
+            &expected_row_indices,
+        );
 
         let every_third_filter = ArrowPredicateFn::new(
             ProjectionMask::leaves(&metadata.file_metadata().schema_descr(), vec![2]),
             |batch| {
                 let remainder = rem(batch.column(0), &UInt16Array::new_scalar(3))?;
                 eq(&remainder, &UInt16Array::new_scalar(0))
-            }
+            },
         );
 
         let row_filter = RowFilter::new(vec![Box::new(every_third_filter)]);
@@ -2630,6 +2661,11 @@ mod tests {
         let expected_row_group_indices = vec![0, 0, 1, 1];
         let expected_row_indices: Vec<u64> = vec![0, 3, 6, 9];
 
-        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+        assert_provenance_columns(
+            &batches,
+            &expected_file_ids,
+            &expected_row_group_indices,
+            &expected_row_indices,
+        );
     }
 }

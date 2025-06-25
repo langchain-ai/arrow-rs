@@ -20,7 +20,7 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, UInt32Array, UInt64Array};
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, DataType as ArrowType, Schema, SchemaRef, Field};
+use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema, SchemaRef};
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 pub use selection::{RowSelection, RowSelector};
 use std::fmt::{Debug, Formatter};
@@ -300,11 +300,11 @@ impl<T> ArrowReaderBuilder<T> {
             ..self
         }
     }
-    
+
     /// Enable reading the rows with provenance information
-    /// 
+    ///
     /// When enabled, the reader will add three additional columns to the Arrow schema:
-    /// 
+    ///
     /// 1. `__file_id` - The file id of the row in the parquet file
     /// 2. `__row_group_idx` - The row group id of the row in the parquet file
     /// 3. `__row_idx` - The row id of the row in the row group
@@ -851,7 +851,7 @@ pub struct ParquetRecordBatchReader {
     schema: SchemaRef,
     read_plan: ReadPlan,
     provenance: bool,
-    file_id:    Option<u32>,
+    file_id: Option<u32>,
     row_group_idx: Option<u32>,
     next_row_abs: Option<u64>, // absolute row number of next row to emit
 }
@@ -920,23 +920,18 @@ impl ParquetRecordBatchReader {
                         rec => {
                             // push absolute indices for the rows just read
                             if let Some(next_row_abs) = self.next_row_abs.as_mut() {
-                                row_numbers.extend(
-                                    (0..rec).map(|i| *next_row_abs + i as u64),
-                                );
+                                row_numbers.extend((0..rec).map(|i| *next_row_abs + i as u64));
                                 *next_row_abs += rec as u64;
                             }
                             read_records += rec;
                         }
-
                     };
                 }
             }
             None => {
                 let rec = self.array_reader.read_records(batch_size)?;
                 if let Some(next_row_abs) = self.next_row_abs.as_mut() {
-                    row_numbers.extend(
-                        (0..rec).map(|i| *next_row_abs + i as u64)
-                    );
+                    row_numbers.extend((0..rec).map(|i| *next_row_abs + i as u64));
                     *next_row_abs += rec as u64;
                 }
             }
@@ -955,10 +950,8 @@ impl ParquetRecordBatchReader {
         if self.provenance {
             let rows = batch.num_rows();
 
-            let file_id_arr =
-                UInt32Array::from(vec![self.file_id.unwrap_or(0); rows]);
-            let rg_idx_arr =
-                UInt32Array::from(vec![self.row_group_idx.unwrap_or(0); rows]);
+            let file_id_arr = UInt32Array::from(vec![self.file_id.unwrap_or(0); rows]);
+            let rg_idx_arr = UInt32Array::from(vec![self.row_group_idx.unwrap_or(0); rows]);
 
             // row_numbers now has exactly `rows` elements
             let row_idx_arr = UInt64Array::from(row_numbers);
@@ -966,19 +959,19 @@ impl ParquetRecordBatchReader {
             let mut cols = batch.columns().to_vec();
             cols.extend([
                 Arc::new(file_id_arr) as _,
-                Arc::new(rg_idx_arr)  as _,
+                Arc::new(rg_idx_arr) as _,
                 Arc::new(row_idx_arr) as _,
             ]);
 
             let fields = batch.schema().fields().clone();
             let mut fields_vec = fields.to_vec();
             fields_vec.extend([
-                Arc::new(Field::new("__file_id", ArrowType::UInt32,  false)),
+                Arc::new(Field::new("__file_id", ArrowType::UInt32, false)),
                 Arc::new(Field::new("__row_group_idx", ArrowType::UInt32, false)),
                 Arc::new(Field::new("__row_idx", ArrowType::UInt64, false)),
             ]);
             let schema: SchemaRef = Arc::new(Schema::new(fields_vec));
-            
+
             let batch = RecordBatch::try_new(schema, cols)?;
             return Ok(Some(batch));
         }
