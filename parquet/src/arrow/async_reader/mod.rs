@@ -1185,21 +1185,20 @@ mod tests {
     use crate::arrow::ArrowWriter;
     use crate::file::metadata::ParquetMetaDataReader;
     use crate::file::properties::WriterProperties;
-    use arrow::compute::kernels::cmp::eq;
+    use arrow::compute::kernels::cmp::{eq, gt_eq};
     use arrow::error::Result as ArrowResult;
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int32Type;
-    use arrow_array::{
-        Array, ArrayRef, Int32Array, Int8Array, RecordBatchReader, Scalar, StringArray,
-        StructArray, UInt64Array,
-    };
+    use arrow_array::types::{Int32Type, UInt16Type, UInt32Type, UInt64Type};
+    use arrow_array::{Array, ArrayRef, BooleanArray, Int32Array, Int8Array, RecordBatchReader, Scalar, StringArray, StructArray, UInt16Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use futures::{StreamExt, TryStreamExt};
     use rand::{rng, Rng};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use tempfile::tempfile;
+    use arrow::compute::kernels::numeric::rem;
+    use arrow_schema::DataType::UInt16;
 
     #[derive(Clone)]
     struct TestReader {
@@ -2461,112 +2460,176 @@ mod tests {
         assert_eq!(result.len(), 1);
     }
 
-    // #[tokio::test]
-    // async fn test_provenance_with_row_filter() {
-    //     // Row group 1:
-    //     //   name: a, b, a, b, a
-    //     //   val: 0, 1, 2, 3, 4
-    //     //   ts: 0, 1, 2, 3, 4
-    //     // Row group 2:
-    //     //   name: b, a, b, a, b
-    //     //   val: 5, 6, 7, 8, 9
-    //     //   ts: 5, 6, 7, 8, 9
-    //     let ts   = Int64Array::from((0..10).collect::<Vec<_>>());
-    //     let name = StringArray::from(vec![
-    //         "alpha","beta","alpha","beta","alpha",
-    //         "beta","gamma","gamma","beta","gamma",
-    //     ]);
-    //     let val  = Int32Array::from((0..10).collect::<Vec<_>>());
-    // 
-    //     let batch = RecordBatch::try_from_iter(vec![
-    //         ("ts",   Arc::new(ts)   as ArrayRef),
-    //         ("name", Arc::new(name) as ArrayRef),
-    //         ("val",  Arc::new(val)  as ArrayRef),
-    //     ]).unwrap();
-    // 
-    //     // write with RG size, two row groups
-    //     let mut buf = Vec::with_capacity(2048);
-    //     let props = WriterProperties::builder()
-    //         .set_max_row_group_size(5)
-    //         .build();
-    //     {
-    //         let mut writer =
-    //             ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
-    //         writer.write(&batch).unwrap();
-    //         writer.close().unwrap();
-    //     }
-    //     let bytes: Bytes = buf.into();
-    //     let test_reader  = TestReader::new(bytes.clone());
-    // 
-    //     // build predicate
-    //     let schema = batch.schema();
-    //     let ts_ge_2 = binary_expr(col("ts"), Operator::GtEq, lit(ScalarValue::from(2_i64)));
-    //     let name_eq = binary_expr(col("name"), Operator::Eq,
-    //                                 lit(ScalarValue::Utf8(Some("gamma".into()))));
-    //     let expr = and(ts_ge_2, name_eq);
-    // 
-    //     let exec_props = execution_props::ExecutionProps::new();
-    //     let phys: Arc<dyn PhysicalExpr> = create_physical_expr(
-    //         &expr, &schema, &schema, &exec_props).unwrap();
-    // 
-    //     let stream = ParquetRecordBatchStreamBuilder::new(test_reader.clone())
-    //         .await
-    //         .unwrap()
-    //         .with_batch_size(1024)
-    //         .with_provenance()
-    //         .with_row_filter(phys)
-    //         .build()
-    //         .unwrap();
-    // 
-    //     let batches = stream.try_collect::<Vec<_>>().await.unwrap();
-    //     assert_eq!(batches.len(), 1, "first RG should be dropped by row-filter");
-    // 
-    //     let result = &batches[0];
-    //     assert_eq!(result.num_rows(), 3);
-    // 
-    //     // columns: ts, name, val, file_id, row_idx, row_group_idx
-    //     let col_ts   = result.column(0).as_primitive::<Int64Array>();
-    //     assert_eq!(col_ts.values(), &[6, 7, 9]);
-    // 
-    //     let file_id  = result.column(3).as_primitive::<Int32Array>();
-    //     assert!(file_id.values().iter().all(|&v| v == file_id.value(0)));
-    // 
-    //     let row_idx  = result.column(4).as_primitive::<UInt64Array>();
-    //     assert_eq!(row_idx.values(), &[6, 7, 9]);
-    //     assert!(row_idx.values().windows(2).all(|w| w[0] < w[1]));
-    // 
-    //     let rg_idx   = result.column(5).as_primitive::<UInt32Array>();
-    //     assert_eq!(rg_idx.values(), &[1, 1, 1]);
-    // 
-    //     // ────────────────────────────────────────── second scenario
-    //     // ts ≤ 3 ∧ name = 'beta' → rows 1,3 in RG 0 only
-    //     let ts_le_3  = binary_expr(col("ts"), Operator::LtEq, lit(ScalarValue::from(3_i64)));
-    //     let beta_eq  = binary_expr(col("name"), Operator::Eq,
-    //                                lit(ScalarValue::Utf8(Some("beta".into()))));
-    //     let expr2    = and(ts_le_3, beta_eq);
-    //     let phys2: Arc<dyn PhysicalExpr> = create_physical_expr(
-    //         &expr2, &schema, &schema, &exec_props).unwrap();
-    // 
-    //     let stream2 = ParquetRecordBatchStreamBuilder::new(test_reader)
-    //         .await
-    //         .unwrap()
-    //         .with_batch_size(1024)
-    //         .with_provenance(true)
-    //         .with_row_filter(phys2)
-    //         .build()
-    //         .unwrap();
-    // 
-    //     let batches2 = stream2.try_collect::<Vec<_>>().await.unwrap();
-    //     assert_eq!(batches2.len(), 1);                                  // RG 1 pruned
-    //     let r2 = &batches2[0];
-    //     assert_eq!(r2.num_rows(), 2);
-    // 
-    //     let ts2 = r2.column(0).as_primitive::<Int64Array>();
-    //     assert_eq!(ts2.values(), &[1, 3]);
-    // 
-    //     let idx2 = r2.column(4).as_primitive::<UInt64Array>();
-    //     assert_eq!(idx2.values(), &[1, 3]);                            // absolute idx
-    //     let rg2  = r2.column(5).as_primitive::<UInt32Array>();
-    //     assert_eq!(rg2.values(), &[0, 0]);                             // RG 0
-    // }
+    fn assert_provenance_columns(
+        batches: &[RecordBatch],
+        expected_file_ids: &[u32],
+        expected_row_group_indices: &[u32],
+        expected_row_indices: &[u64],
+    ) {
+        assert!(!batches.is_empty(), "No batches provided");
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, expected_file_ids.len(), "Total rows mismatch");
+        assert_eq!(total_rows, expected_row_group_indices.len(), "Row group indices length mismatch");
+        assert_eq!(total_rows, expected_row_indices.len(), "Row indices length mismatch");
+
+        let schema = batches[0].schema();
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Verify provenance columns are present
+        assert!(field_names.contains(&"__file_id"), "Missing __file_id column");
+        assert!(field_names.contains(&"__row_group_idx"), "Missing __row_group_idx column");
+        assert!(field_names.contains(&"__row_idx"), "Missing __row_idx column");
+
+        let file_id_idx = schema.index_of("__file_id").unwrap();
+        let row_group_idx_idx = schema.index_of("__row_group_idx").unwrap();
+        let row_idx_idx = schema.index_of("__row_idx").unwrap();
+
+        let mut all_file_ids = Vec::new();
+        let mut all_row_group_indices = Vec::new();
+        let mut all_row_indices = Vec::new();
+
+        for batch in batches {
+            let file_id_col = batch.column(file_id_idx).as_primitive::<UInt32Type>();
+            let row_group_col = batch.column(row_group_idx_idx).as_primitive::<UInt32Type>();
+            let row_idx_col = batch.column(row_idx_idx).as_primitive::<UInt64Type>();
+
+            all_file_ids.extend(file_id_col.values().iter().copied());
+            all_row_group_indices.extend(row_group_col.values().iter().copied());
+            all_row_indices.extend(row_idx_col.values().iter().copied());
+        }
+
+        // Verify values match expectations
+        assert_eq!(all_file_ids, expected_file_ids, "File IDs don't match expected values");
+        assert_eq!(all_row_group_indices, expected_row_group_indices, "Row group indices don't match expected values");
+        assert_eq!(all_row_indices, expected_row_indices, "Row indices don't match expected values");
+    }
+    #[tokio::test]
+    async fn test_provenance_with_row_filter() {
+        // Row group 1:
+        //   name: a, b, c, d, e
+        //   val:  0, 1, 2, 3, 4
+        //   ts:   0, 1, 2, 3, 4
+        // Row group 2:
+        //   name: f, g, h, i, j
+        //   val:  5, 6, 7, 8, 9
+        //   ts:   5, 6, 7, 8, 9
+        let ts = UInt16Array::from((0..10).collect::<Vec<_>>());
+        let name = StringArray::from(vec![
+            "a","b","c","d","e","f","g","h","i","j",
+        ]);
+        let val= UInt16Array::from((0..10).collect::<Vec<_>>());
+
+        let batch = RecordBatch::try_from_iter(vec![
+            ("ts",   Arc::new(ts)   as ArrayRef),
+            ("name", Arc::new(name) as ArrayRef),
+            ("val",  Arc::new(val)  as ArrayRef),
+        ]).unwrap();
+
+        // write with RG size, two row groups
+        let mut buf = Vec::with_capacity(2048);
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(5)
+            .build();
+        {
+            let mut writer =
+                ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let bytes: Bytes = buf.into();
+        let test_reader = TestReader::new(bytes.clone());
+
+        // sanity check
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes)
+            .unwrap();
+
+        assert_eq!(metadata.num_row_groups(), 2);
+        assert_eq!(metadata.row_group(0).num_rows(), 5);
+        assert_eq!(metadata.row_group(1).num_rows(), 5);
+
+        let stream = ParquetRecordBatchStreamBuilder::new(test_reader.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .with_provenance()
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        // since two row groups, two batches
+        assert_eq!(batches.len(), 2);
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10);
+
+        let expected_file_ids = vec![0; 10];
+        let expected_row_group_indices = vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
+        let expected_row_indices: Vec<u64> = (0..10).collect();
+
+        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+
+        // This should keep rows 5-9 (from row group 1)
+        let val_filter = ArrowPredicateFn::new(
+            ProjectionMask::leaves(&metadata.file_metadata().schema_descr(), vec![2]),
+            |batch| {
+                gt_eq(batch.column(0), &UInt16Array::new_scalar(5))
+            }
+        );
+
+        let row_filter = RowFilter::new(vec![Box::new(val_filter)]);
+
+        let stream = ParquetRecordBatchStreamBuilder::new(test_reader.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .with_provenance()
+            .with_row_filter(row_filter)
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+
+        let expected_file_ids = vec![0; 5];
+        let expected_row_group_indices = vec![1, 1, 1, 1, 1];
+        let expected_row_indices: Vec<u64> = (5..10).collect();
+
+        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+
+        let every_third_filter = ArrowPredicateFn::new(
+            ProjectionMask::leaves(&metadata.file_metadata().schema_descr(), vec![2]),
+            |batch| {
+                let remainder = rem(batch.column(0), &UInt16Array::new_scalar(3))?;
+                eq(&remainder, &UInt16Array::new_scalar(0))
+            }
+        );
+
+        let row_filter = RowFilter::new(vec![Box::new(every_third_filter)]);
+
+        let stream = ParquetRecordBatchStreamBuilder::new(test_reader.clone())
+            .await
+            .unwrap()
+            .with_batch_size(1024)
+            .with_provenance()
+            .with_row_filter(row_filter)
+            .build()
+            .unwrap();
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        assert_eq!(batches.len(), 2);
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 4);
+
+        let expected_file_ids = vec![0; 4];
+        let expected_row_group_indices = vec![0, 0, 1, 1];
+        let expected_row_indices: Vec<u64> = vec![0, 3, 6, 9];
+
+        assert_provenance_columns(&batches, &expected_file_ids, &expected_row_group_indices, &expected_row_indices);
+    }
 }

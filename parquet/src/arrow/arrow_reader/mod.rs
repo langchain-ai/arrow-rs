@@ -971,14 +971,16 @@ impl ParquetRecordBatchReader {
             ]);
 
             let fields = batch.schema().fields().clone();
-            fields.to_vec().extend([
+            let mut fields_vec = fields.to_vec();
+            fields_vec.extend([
                 Arc::new(Field::new("__file_id", ArrowType::UInt32,  false)),
                 Arc::new(Field::new("__row_group_idx", ArrowType::UInt32, false)),
                 Arc::new(Field::new("__row_idx", ArrowType::UInt64, false)),
             ]);
-            let schema: SchemaRef = Arc::new(Schema::new(fields));
+            let schema: SchemaRef = Arc::new(Schema::new(fields_vec));
             
-            RecordBatch::try_new(schema, cols)?;
+            let batch = RecordBatch::try_new(schema, cols)?;
+            return Ok(Some(batch));
         }
 
         Ok(Some(batch))
