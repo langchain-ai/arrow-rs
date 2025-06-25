@@ -18,9 +18,9 @@
 //! Contains reader which reads parquet data into arrow [`RecordBatch`]
 
 use arrow_array::cast::AsArray;
-use arrow_array::Array;
+use arrow_array::{Array, UInt32Array, UInt64Array};
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, DataType as ArrowType, Schema, SchemaRef};
+use arrow_schema::{ArrowError, DataType as ArrowType, Field, Schema, SchemaRef};
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 pub use selection::{RowSelection, RowSelector};
 use std::fmt::{Debug, Formatter};
@@ -112,6 +112,8 @@ pub struct ArrowReaderBuilder<T> {
     pub(crate) limit: Option<usize>,
 
     pub(crate) offset: Option<usize>,
+
+    pub(crate) provenance: bool,
 }
 
 impl<T: Debug> Debug for ArrowReaderBuilder<T> {
@@ -128,6 +130,7 @@ impl<T: Debug> Debug for ArrowReaderBuilder<T> {
             .field("selection", &self.selection)
             .field("limit", &self.limit)
             .field("offset", &self.offset)
+            .field("provenance", &self.provenance)
             .finish()
     }
 }
@@ -146,6 +149,7 @@ impl<T> ArrowReaderBuilder<T> {
             selection: None,
             limit: None,
             offset: None,
+            provenance: false,
         }
     }
 
@@ -293,6 +297,20 @@ impl<T> ArrowReaderBuilder<T> {
     pub fn with_offset(self, offset: usize) -> Self {
         Self {
             offset: Some(offset),
+            ..self
+        }
+    }
+
+    /// Enable reading the rows with provenance information
+    ///
+    /// When enabled, the reader will add three additional columns to the Arrow schema:
+    ///
+    /// 1. `__file_id` - The file id of the row in the parquet file
+    /// 2. `__row_group_idx` - The row group id of the row in the parquet file
+    /// 3. `__row_idx` - The row id of the row in the row group
+    pub fn with_provenance(self) -> Self {
+        Self {
+            provenance: true,
             ..self
         }
     }
@@ -832,6 +850,10 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     read_plan: ReadPlan,
+    provenance: bool,
+    file_id: Option<u32>,
+    row_group_idx: Option<u32>,
+    next_row_abs: Option<u64>, // absolute row number of next row to emit
 }
 
 impl Iterator for ParquetRecordBatchReader {
@@ -853,6 +875,8 @@ impl ParquetRecordBatchReader {
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
         let mut read_records = 0;
         let batch_size = self.batch_size();
+        let mut row_numbers: Vec<u64> = Vec::with_capacity(batch_size);
+
         match self.read_plan.selection_mut() {
             Some(selection) => {
                 while read_records < batch_size && !selection.is_empty() {
@@ -866,6 +890,10 @@ impl ParquetRecordBatchReader {
                                 front.row_count,
                                 skipped
                             ));
+                        }
+                        // advance absolute cursor for skipped rows
+                        if let Some(next_row_abs) = self.next_row_abs.as_mut() {
+                            *next_row_abs += front.row_count as u64;
                         }
                         continue;
                     }
@@ -889,12 +917,23 @@ impl ParquetRecordBatchReader {
                     };
                     match self.array_reader.read_records(to_read)? {
                         0 => break,
-                        rec => read_records += rec,
+                        rec => {
+                            // push absolute indices for the rows just read
+                            if let Some(next_row_abs) = self.next_row_abs.as_mut() {
+                                row_numbers.extend((0..rec).map(|i| *next_row_abs + i as u64));
+                                *next_row_abs += rec as u64;
+                            }
+                            read_records += rec;
+                        }
                     };
                 }
             }
             None => {
-                self.array_reader.read_records(batch_size)?;
+                let rec = self.array_reader.read_records(batch_size)?;
+                if let Some(next_row_abs) = self.next_row_abs.as_mut() {
+                    row_numbers.extend((0..rec).map(|i| *next_row_abs + i as u64));
+                    *next_row_abs += rec as u64;
+                }
             }
         };
 
@@ -903,11 +942,41 @@ impl ParquetRecordBatchReader {
             ArrowError::ParquetError("Struct array reader should return struct array".to_string())
         })?;
 
-        Ok(if struct_array.len() > 0 {
-            Some(RecordBatch::from(struct_array))
-        } else {
-            None
-        })
+        if struct_array.len() == 0 {
+            return Ok(None);
+        }
+
+        let batch = RecordBatch::from(struct_array);
+        if self.provenance {
+            let rows = batch.num_rows();
+
+            let file_id_arr = UInt32Array::from(vec![self.file_id.unwrap_or(0); rows]);
+            let rg_idx_arr = UInt32Array::from(vec![self.row_group_idx.unwrap_or(0); rows]);
+
+            // row_numbers now has exactly `rows` elements
+            let row_idx_arr = UInt64Array::from(row_numbers);
+
+            let mut cols = batch.columns().to_vec();
+            cols.extend([
+                Arc::new(file_id_arr) as _,
+                Arc::new(rg_idx_arr) as _,
+                Arc::new(row_idx_arr) as _,
+            ]);
+
+            let fields = batch.schema().fields().clone();
+            let mut fields_vec = fields.to_vec();
+            fields_vec.extend([
+                Arc::new(Field::new("__file_id", ArrowType::UInt32, false)),
+                Arc::new(Field::new("__row_group_idx", ArrowType::UInt32, false)),
+                Arc::new(Field::new("__row_idx", ArrowType::UInt64, false)),
+            ]);
+            let schema: SchemaRef = Arc::new(Schema::new(fields_vec));
+
+            let batch = RecordBatch::try_new(schema, cols)?;
+            return Ok(Some(batch));
+        }
+
+        Ok(Some(batch))
     }
 }
 
@@ -952,6 +1021,10 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             read_plan,
+            provenance: false,
+            file_id: None,
+            row_group_idx: None,
+            next_row_abs: None,
         })
     }
 
@@ -968,6 +1041,34 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             read_plan,
+            provenance: false,
+            file_id: None,
+            row_group_idx: None,
+            next_row_abs: None,
+        }
+    }
+
+    pub(crate) fn new_with_provenance(
+        array_reader: Box<dyn ArrayReader>,
+        read_plan: ReadPlan,
+        provenance: bool,
+        file_id: Option<u32>,
+        row_group_idx: Option<u32>,
+        file_row_base: Option<u64>,
+    ) -> Self {
+        let schema = match array_reader.get_data_type() {
+            ArrowType::Struct(ref fields) => Schema::new(fields.clone()),
+            _ => unreachable!("Struct array reader's data type is not struct!"),
+        };
+
+        Self {
+            array_reader,
+            schema: Arc::new(schema),
+            read_plan,
+            provenance,
+            file_id,
+            row_group_idx,
+            next_row_abs: file_row_base,
         }
     }
 
